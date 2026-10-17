@@ -1,0 +1,13 @@
+anthropic
+httpx
+pydantic
+pandas
+numpy
+scipy
+statsmodels
+fastapi
+uvicorn
+pytest
+pyreadstat
+xlrd
+pypdf

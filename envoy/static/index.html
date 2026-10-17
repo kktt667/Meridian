@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Envoy control room</title>
+<style>
+  :root { --bg:#0e1116; --panel:#161b22; --line:#262d36; --ink:#e6edf3; --mut:#8b949e; --acc:#58a6ff;
+          --ok:#3fb950; --bad:#f85149; --warn:#d29922; --grey:#6e7681; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  header { padding:14px 20px; border-bottom:1px solid var(--line); display:flex; gap:16px; align-items:baseline; flex-wrap:wrap; }
+  header h1 { margin:0; font-size:20px; } header .sub { color:var(--mut); }
+  .chip { display:inline-block; padding:2px 8px; border:1px solid var(--line); border-radius:999px; font-size:12px; color:var(--mut); margin-right:6px; }
+  main { display:grid; grid-template-columns: 340px 1fr; gap:14px; padding:14px 20px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin-bottom:14px; }
+  .panel h2 { margin:0 0 8px; font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--mut); }
+  textarea, select, input { width:100%; background:#0d1117; color:var(--ink); border:1px solid var(--line); border-radius:6px; padding:7px; font:inherit; }
+  textarea { min-height:90px; resize:vertical; }
+  label { display:block; font-size:12px; color:var(--mut); margin:8px 0 3px; }
+  button { background:var(--acc); color:#04111f; border:0; border-radius:6px; padding:8px 12px; font-weight:600; cursor:pointer; margin-top:10px; }
+  button.sec { background:transparent; color:var(--ink); border:1px solid var(--line); }
+  button:disabled { opacity:.5; cursor:default; }
+  .steps { display:flex; flex-wrap:wrap; gap:6px; }
+  .step { padding:4px 9px; border-radius:6px; border:1px solid var(--line); color:var(--mut); font-size:12px; }
+  .step.on { border-color:var(--acc); color:var(--ink); background:#132235; }
+  .step.done { border-color:#1f6f3a; color:var(--ok); }
+  .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap:10px; }
+  .card { border:1px solid var(--line); border-radius:8px; padding:10px; background:#0d1117; }
+  .card .t { font-weight:600; } .mut { color:var(--mut); font-size:12px; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); } .warn { color:var(--warn); } .grey { color:var(--grey); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:5px 6px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--mut); font-weight:500; }
+  .log { font:12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; max-height:240px; overflow:auto; white-space:pre-wrap; color:#c9d1d9; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:6px; font-weight:700; font-size:12px; }
+  .b-supported { background:#12361f; color:var(--ok); } .b-not_supported { background:#3a1416; color:var(--bad); }
+  .b-inconsistent { background:#3a2c0b; color:var(--warn); } .b-inconclusive { background:#22262c; color:#b1bac4; }
+  .big { font-size:26px; font-weight:700; } .kpis { display:flex; gap:22px; flex-wrap:wrap; }
+  .heat td.s { text-align:center; font-variant-numeric: tabular-nums; border-radius:4px; }
+  details summary { cursor:pointer; color:var(--acc); font-size:12px; }
+  a { color:var(--acc); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Envoy</h1>
+  <span class="sub">Federated health research: data stays in each lab; agents hire each other; statistics cap every claim.</span>
+  <span id="env"></span>
+</header>
+<main>
+  <div>
+    <div class="panel">
+      <h2>Ask</h2>
+      <label>Demo question</label>
+      <select id="demo"></select>
+      <label>Home lab (the researcher's own)</label>
+      <select id="home"></select>
+      <label>Question</label>
+      <textarea id="q"></textarea>
+      <label>Researcher document (stays local to the planner)</label>
+      <textarea id="doc" style="min-height:70px"></textarea>
+      <label>Mode</label>
+      <select id="mode"><option value="fast">fast: vector panel + 1 narrator call</option><option value="deep">deep: full multi-agent debate (slow)</option></select>
+      <button id="run">Run live</button>
+    </div>
+    <div class="panel">
+      <h2>Replay a recorded run</h2>
+      <select id="runs"></select>
+      <label>Speed</label>
+      <select id="speed"><option value="1">1x (real time)</option><option value="4" selected>4x</option><option value="20">20x</option></select>
+      <button class="sec" id="replay">Replay</button>
+      <div class="mut" id="replaynote"></div>
+    </div>
+    <div class="panel">
+      <h2>Event log</h2>
+      <div class="log" id="log"></div>
+    </div>
+  </div>
+  <div>
+    <div class="panel"><h2>Pipeline</h2><div class="steps" id="steps"></div></div>
+    <div class="panel"><h2>Performance</h2><div class="kpis" id="kpis"><span class="mut">Run a question to see timings.</span></div></div>
+    <div class="panel"><h2>Plan: what we can establish locally vs what needs help</h2><div id="plan" class="mut">No run yet.</div></div>
+    <div class="panel"><h2>Marketplace: labs, pre-flight and decisions</h2><div class="grid" id="market"></div></div>
+    <div class="panel"><h2>Lab traffic: gate, vector operations, x402 payment</h2><table id="traffic"><thead><tr><th>Lab</th><th>Purpose</th><th>Gate</th><th>Compute</th><th>Payment</th></tr></thead><tbody></tbody></table></div>
+    <div class="panel"><h2>Vector panel: caution score per claim and reviewer lens (dissent above threshold)</h2><div id="heat" class="mut">Fast mode only.</div></div>
+    <div class="panel"><h2>Verdicts</h2><div id="verdicts" class="grid"></div></div>
+    <div class="panel"><h2>Narrative (number-guarded)</h2><div id="narr" class="mut">-</div></div>
+    <div class="panel"><h2>Audit and sign-off</h2><div id="audit" class="mut">-</div>
+      <button class="sec" data-d="accept">Accept</button> <button class="sec" data-d="challenge">Challenge</button> <button class="sec" data-d="reject">Reject</button></div>
+  </div>
+</main>
+<script>
+const STEPS = ["planning","discovering_labs","hired","protocol_preregistered","querying_labs","deliberating","steward_review","narrating","awaiting_signoff"];
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+let current = null, demos = [];
+
+function resetView() {
+  $("#log").textContent = ""; $("#market").innerHTML = ""; $("#traffic tbody").innerHTML = "";
+  $("#verdicts").innerHTML = ""; $("#heat").textContent = "Waiting for the panel..."; $("#narr").textContent = "-";
+  $("#plan").textContent = "Planning..."; $("#audit").textContent = "-"; $("#kpis").innerHTML = "";
+  $("#steps").innerHTML = STEPS.map(s => `<span class="step" id="st-${s}">${s.replace(/_/g," ")}</span>`).join("");
+}
+function markStage(name) {
+  const i = STEPS.indexOf(name); if (i < 0) return;
+  STEPS.forEach((s, j) => { const el = $("#st-" + s); if (!el) return; el.className = "step" + (j < i ? " done" : j === i ? " on" : ""); });
+}
+function log(line) { const el = $("#log"); el.textContent += line + "\n"; el.scrollTop = el.scrollHeight; }
+
+function onEvent(ev) {
+  const t = (ev.t ?? 0).toFixed(1).padStart(6);
+  if (ev.kind === "stage") {
+    markStage(ev.stage);
+    log(`[${t}s] ${ev.stage}` + (ev.labs ? " " + ev.labs.join(", ") : "") + (ev.protocol_hash ? " " + ev.protocol_hash : ""));
+    if (ev.stage === "lab_decision") {
+      $("#market").insertAdjacentHTML("beforeend", `<div class="card"><div class="t">${esc(ev.lab)}</div>
+        <div class="mut">capability: ${esc(ev.capability)}</div><div class="${ev.accept ? "ok" : "bad"}">${ev.accept ? "accepted job" : "declined"}</div></div>`);
+    }
+  } else if (ev.kind === "lab") {
+    if (ev.step && ev.step.startsWith("gate_")) {
+      const ok = ev.step === "gate_ok";
+      const ops = (ev.compute_trace || []).map(o => `${o.op}${o.rows ? " [" + o.rows + "]" : ""} ${o.ms} ms${o.iterations ? " (" + o.iterations + " iter)" : ""}: ${o.meaning}`).join("\n");
+      $("#traffic tbody").insertAdjacentHTML("beforeend", `<tr><td>${esc(ev.lab)}${ev.local ? " <span class='mut'>(home)</span>" : ""}</td>
+        <td>${esc(ev.purpose)}</td><td class="${ok ? "ok" : "bad"}">${ok ? "approved" : "refused: " + esc(ev.refusal)}</td>
+        <td>${(ev.compute_ms ?? 0).toFixed(1)} ms<details><summary>${(ev.compute_trace || []).length} vector ops</summary><div class="log">${esc(ops)}</div></details></td>
+        <td id="pay-${esc(ev.query_id)}">${esc(ev.payment)}</td></tr>`);
+      log(`[${t}s]   ${ev.lab} ${ok ? "approved" : "REFUSED " + ev.refusal} ${(ev.compute_ms ?? 0).toFixed(1)} ms pay: ${ev.payment}`);
+    } else if (ev.step && ev.step.startsWith("x402_") && ev.transaction) {
+      const cell = document.getElementById("pay-" + ev.query_id);
+      const link = `<a target="_blank" href="https://sepolia.basescan.org/tx/${ev.transaction}">settled on Base Sepolia ↗</a>`;
+      if (cell) cell.innerHTML = link;
+      log(`[${t}s]   x402 settled ${ev.transaction.slice(0, 18)}...`);
+    }
+  } else if (ev.kind === "agent_call") {
+    log(`[${t}s]   agent ${ev.role} on ${ev.model}: ${ev.seconds}s, ${ev.output_tokens} tokens`);
+  } else if (ev.kind === "vector_panel") {
+    log(`[${t}s]   vector panel: ${ev.claims} claims x ${ev.features} features x ${ev.lenses} lenses in ${ev.ms} ms`);
+  } else if (ev.kind === "error") {
+    log("ERROR: " + ev.error);
+  } else if (ev.kind === "result") {
+    render(ev.result);
+  }
+}
+
+function render(r) {
+  current = r;
+  markStage("awaiting_signoff");
+  const p = r.plan || {};
+  $("#plan").innerHTML = `<div><b>${esc(p.restated_question)}</b></div>
+    <div class="mut">recipe: ${esc(r.recipe)} · purpose: ${esc(p.purpose_category)} · protocol hash ${esc((r.protocol || {}).protocol_hash?.slice(0, 16))}</div>
+    <table><tr><th>Question part (computed locally first)</th><th>Status</th></tr>${(r.local_breakdown || []).map(s =>
+      `<tr><td>${esc(s.question_part)}<div class="mut">${esc(s.detail)}</div></td><td class="${s.status === "needs_help" ? "warn" : "ok"}">${esc(s.status)}</td></tr>`).join("")}</table>
+    ${(r.plan_corrections || []).length ? `<div class="mut">validator repairs: ${esc(r.plan_corrections.join("; "))}</div>` : ""}`;
+  const m = r.marketplace || {};
+  $("#market").innerHTML = (m.cards || []).map(c => {
+    const d = m.decisions[c.lab_id] || {}, hired = (m.hired || []).includes(c.lab_id);
+    return `<div class="card"><div class="t">${esc(c.lab_id)} ${hired ? "<span class='ok'>· hired</span>" : ""}</div>
+      <div class="mut">${esc(c.country)} · ${esc(c.region)} · agent: ${esc(c.agent_model)}</div>
+      <div>${c.preflight.map(x => `<div class="${x.can_answer ? "ok" : "bad"}">${x.can_answer ? "✓" : "✗"} ${esc(x.requirement)}${x.refusal ? " (" + esc(x.refusal) + ")" : ""}</div>`).join("")}</div>
+      <div class="${d.accept ? "ok" : "bad"}">${d.accept ? "accepted" : "declined"}: <span class="mut">${esc(d.reason)}</span></div>
+      <div class="mut">reputation: ${c.reputation.queries_served} queries served, answer rate ${c.reputation.answer_rate ?? "-"}</div></div>`;
+  }).join("");
+  const D = r.debate || {};
+  if (D.S) {
+    const th = D.thresholds;
+    $("#heat").innerHTML = `<table class="heat"><tr><th>Claim</th>${D.lenses.map(l => `<th>${esc(l)}</th>`).join("")}</tr>` +
+      Object.entries(D.S).map(([cid, s]) => `<tr><td>${cid}</td>${D.lenses.map((l, j) => {
+        const v = s[l], over = v > th[j], a = Math.min(1, v / (th[j] * 1.6));
+        return `<td class="s" style="background:rgba(${over ? "248,81,73" : "88,166,255"},${0.15 + 0.55 * a})">${v.toFixed(2)}${over ? " ⚑" : ""}</td>`;
+      }).join("")}</tr>`).join("") + `</table><div class="mut">Score = features (imprecision, closeness to no-effect, inconsistency, refusals, cross-population, small counts, weak effect) × lens weights. ⚑ = lens votes more cautiously than the statistics. Threshold ${th.join(" / ")}.</div>`;
+  } else { $("#heat").textContent = "Deep mode: votes came from the language-model panel."; }
+  $("#verdicts").innerHTML = (r.verdicts || []).map(v => `<div class="card"><span class="badge b-${v.final}">${v.final.replace("_", " ").toUpperCase()}</span>
+    ${v.human_review_required ? "<span class='warn'> · human review</span>" : ""}
+    <div style="margin:6px 0">${esc(v.statement)}</div>
+    <div class="mut">statistics: ${esc(v.ceiling_reason)}</div>
+    <div class="mut">votes: ${esc(JSON.stringify(v.votes))} · certainty: <b>${esc(v.certainty?.level)}</b></div>
+    <div class="mut">${v.established_locally ? "established by the home lab" : "needed other labs"}</div></div>`).join("");
+  const n = r.narrative || {};
+  $("#narr").innerHTML = `<div class="t" style="font-size:16px">${esc(n.headline)}</div><ul>${(n.summary || []).map(x => `<li>${esc(x)}</li>`).join("")}</ul>
+    <div class="mut">What would change it: ${esc((n.what_would_change_it || []).join(" · "))}</div>
+    <div class="mut">Number guard: ${(n.unverified_numbers || []).length ? "<span class='bad'>unverified " + esc(n.unverified_numbers.join(", ")) + "</span>" : "<span class='ok'>every number traced to the audit</span>"} · narrator: ${esc(n.mode)}</div>`;
+  const pf = r.performance || {}, pay = r.payments || {}, ai = r.ai || {};
+  const real = (pay.receipts || []).filter(x => !x.simulated && x.status === "settled").length;
+  $("#kpis").innerHTML = `<div><div class="big">${pf.lab_compute_ms} ms</div><div class="mut">all maths inside labs (${pf.vector_ops} vector ops)</div></div>
+    <div><div class="big">${pf.llm_seconds} s</div><div class="mut">language models (${pf.llm_calls} calls, ${esc(ai.mode)})</div></div>
+    <div><div class="big">0 rows</div><div class="mut">of patient data moved</div></div>
+    <div><div class="big">$${pay.spent_usd}</div><div class="mut">${real ? real + " real x402 settlements (testnet)" : "simulated payments"}</div></div>`;
+  $("#audit").innerHTML = `run ${esc(r.run_id)} · status <b>${esc(r.status)}</b> · protocol pre-registered <code>${esc((r.protocol || {}).protocol_hash?.slice(0, 24))}…</code>
+    ${r.audit_chain ? ` · audit chain <span class="${r.audit_chain.valid ? "ok" : "bad"}">${r.audit_chain.valid ? "valid" : "BROKEN"}</span> (${r.audit_chain.entries} entries)` : ""}`;
+  loadRuns();
+}
+
+async function runLive() {
+  resetView(); $("#run").disabled = true;
+  const body = {question: $("#q").value, home: $("#home").value, mode: $("#mode").value,
+                documents: $("#doc").value.trim() ? [{name: "researcher_document.md", text: $("#doc").value}] : []};
+  try {
+    const res = await fetch("/runs/stream", {method: "POST", headers: {"content-type": "application/json"}, body: JSON.stringify(body)});
+    const reader = res.body.getReader(), dec = new TextDecoder(); let buf = "";
+    for (;;) {
+      const {value, done} = await reader.read(); if (done) break;
+      buf += dec.decode(value, {stream: true});
+      let i; while ((i = buf.indexOf("\n\n")) >= 0) {
+        const chunk = buf.slice(0, i); buf = buf.slice(i + 2);
+        if (chunk.startsWith("data: ")) onEvent(JSON.parse(chunk.slice(6)));
+      }
+    }
+  } catch (e) { log("ERROR " + e); }
+  $("#run").disabled = false;
+}
+
+async function replay() {
+  const id = $("#runs").value; if (!id) return;
+  const r = await (await fetch("/runs/" + id)).json(); const speed = +$("#speed").value;
+  resetView(); $("#replaynote").textContent = `Replaying recorded run ${id} at ${speed}x (real timings).`;
+  let prev = 0;
+  for (const ev of r.timeline || []) {
+    await new Promise(ok => setTimeout(ok, Math.min(4000, (ev.t - prev) * 1000 / speed))); prev = ev.t; onEvent(ev);
+  }
+  render(r);
+}
+
+async function signoff(decision) {
+  if (!current) return;
+  const r = await (await fetch(`/runs/${current.run_id}/signoff`, {method: "POST", headers: {"content-type": "application/json"},
+    body: JSON.stringify({decision, reviewer: "demo-researcher"})})).json();
+  render(r);
+}
+
+async function loadRuns() {
+  const runs = await (await fetch("/runs")).json();
+  $("#runs").innerHTML = runs.map(x => `<option value="${x.run_id}">${x.run_id} · ${esc(x.home)} · ${esc(x.mode)} · ${esc(x.status)}</option>`).join("");
+}
+
+async function init() {
+  const info = await (await fetch("/info")).json();
+  $("#env").innerHTML = `<span class="chip">AI: ${esc(info.backend)}</span><span class="chip">transport: ${esc(info.transport)}</span><span class="chip">labs: ${info.labs.length}</span>`;
+  $("#home").innerHTML = info.labs.map(l => `<option>${l}</option>`).join("");
+  demos = await (await fetch("/demos")).json();
+  $("#demo").innerHTML = demos.map(d => `<option value="${d.id}">Q${d.id}: ${esc(d.home)}</option>`).join("");
+  const pick = () => { const d = demos.find(x => x.id === $("#demo").value); $("#q").value = d.question; $("#home").value = d.home; $("#doc").value = d.documents[0]?.text || ""; };
+  $("#demo").onchange = pick; pick();
+  $("#run").onclick = runLive; $("#replay").onclick = replay;
+  document.querySelectorAll("button[data-d]").forEach(b => b.onclick = () => signoff(b.dataset.d));
+  resetView(); loadRuns();
+}
+init();
+</script>
+</body>
+</html>
