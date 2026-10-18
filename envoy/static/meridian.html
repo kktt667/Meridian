@@ -146,6 +146,7 @@ button.brand{background:none;border:0;cursor:pointer;color:var(--ink);padding:0}
 .onlyw input{accent-color:var(--teal)}
 [hidden]{display:none!important}
 
+.bids{width:100%;border-collapse:collapse;margin-top:8px;font-size:12px}.bids th,.bids td{text-align:left;padding:4px 6px;border-top:1px solid rgba(127,127,127,.25);vertical-align:top}.bids th{font-weight:600;opacity:.7}.bids tr.won td{font-weight:600}.bids small{opacity:.6;font-weight:400}
 .vrow{display:grid;grid-template-columns:110px 1fr;gap:10px;align-items:start;padding:8px 0;border-top:1px solid var(--line)}
 .vrow:first-child{border-top:0}
 .badge{display:inline-block;font-size:12px;font-weight:700;padding:3px 9px;border-radius:6px;text-transform:uppercase;letter-spacing:.02em}
@@ -218,6 +219,8 @@ details.doc textarea{min-height:90px;font:14px/1.45 system-ui,sans-serif;margin-
         <div><div class="lab">Verdicts (statistics ceiling × panel vote, most cautious wins)</div><div id="verdicts"></div></div>
         <div><div class="lab">What crossed the boundary</div><table id="led"></table></div>
       </div>
+      <div class="lab" style="margin-top:14px">Bias checks (bias-aware ML: features computed from gated aggregates, no language model)</div>
+      <div id="bias"></div>
       <div class="hash" id="hash"></div>
       <div class="signoff"><button class="go2" data-d="accept">Accept and sign</button><button class="again" data-d="challenge" style="margin-top:0">Challenge</button><button class="again" data-d="reject" style="margin-top:0">Reject</button></div>
       <button class="again" id="again">Ask another question</button>
@@ -321,7 +324,8 @@ var GEO={US_BRFSS_2023:{city:'Atlanta, USA',ll:[-84.39,33.75],short:'US BRFSS ag
  KOREA_KNHANES_2024:{city:'Cheongju, South Korea',ll:[127.49,36.64],short:'Korea KNHANES agent'}};
 var DEMOPREF={'2':['KOREA_KNHANES_2024'],'6':['US_BRFSS_2023','BRAZIL_PNS_2019'],'5':['US_NHANES_2017']};
 var DEMOTITLE={'2':'US asks Korea: East Asian stroke risk','6':'Korea asks: young-adult stroke signal','5':'Korea asks: undiagnosed hypertension'};
-var CAT=[],LABINFO={},DEMOS=[],SELD={},NET=[];
+var CAT=[],LABINFO={},DEMOS=[],SELD={},NET=[],BIAS=null;
+fetch('/bias_report').then(function(r){return r.ok?r.json():null}).then(function(j){BIAS=j}).catch(function(){});
 function shortName(id){return (GEO[id]&&GEO[id].short)||id}
 function vec(ll){var a=ll[0]*Math.PI/180,b=ll[1]*Math.PI/180;return [Math.cos(b)*Math.cos(a),Math.cos(b)*Math.sin(a),Math.sin(b)]}
 var G={cur:null};
@@ -465,7 +469,7 @@ function globeStart(){
 
 /* ---------------- agent threads: live stream ---------------- */
 var STAGES=['Plan','Marketplace','Protocol locked','Gate + x402','Panel vote','Stewards','Narrative','Sign-off'];
-var STAGEIX={planning:0,plan_ready:0,discovering_labs:1,lab_decision:1,hired:1,protocol_preregistered:2,querying_labs:3,evidence_ready:3,deliberating:4,steward_review:5,narrating:6,awaiting_signoff:7};
+var STAGEIX={planning:0,plan_ready:0,discovering_labs:1,lab_decision:1,bids:1,hired:1,protocol_preregistered:2,querying_labs:3,evidence_ready:3,deliberating:4,steward_review:5,narrating:6,awaiting_signoff:7};
 var running=false,current=null,HOME='';
 function setStage(i){var l=$('stages').children;for(var k=0;k<l.length;k++){l[k].className=k<i?'done':(k===i?'run':'')}}
 function msg(side,who,text,kind){
@@ -487,6 +491,11 @@ function onEvent(ev){
   if(ev.stage==='planning'){msg('l','Your agent','Reading your question and documents. I will split it into what our own data can establish and what needs other labs.','think')}
   else if(ev.stage==='plan_ready'){msg('l','Your agent','Plan ready: analysis recipe <b>'+esc(ev.recipe)+'</b>. I can only choose pre-approved, gated analyses.','send');bound('Crosses the boundary: job scope only (purpose, analysis, required aggregates)')}
   else if(ev.stage==='lab_decision'){msg('r',shortName(ev.lab),'Pre-flight on your job: <b>'+esc(ev.capability)+'</b> capability on our real data. '+(ev.accept?'<b>Accepted</b>.':'<b>Declined</b>, deposit refunded.'),'think')}
+  else if(ev.stage==='bids'){
+   var rs=(ev.selection||{}).reasons||{},rows='';
+   (ev.bids||[]).forEach(function(b){var won=/^won/.test(rs[b.lab_id]||'');
+    rows+='<tr'+(won?' class="won"':'')+'><td>'+esc(shortName(b.lab_id))+'</td><td>'+esc(b.capability)+'</td><td>'+(b.answer_rate==null?'new':Math.round(b.answer_rate*100)+'%')+(b.sla_failures?' · '+b.sla_failures+' SLA':'')+'</td><td>$'+b.job_quote_usd.toFixed(2)+'<small> ('+b.queries+'×$'+b.price_per_query_usd.toFixed(2)+')</small></td><td>'+esc(rs[b.lab_id]||'')+'</td></tr>'});
+   msg('l','Your agent','Sealed bids in. Rule: <b>'+esc((ev.selection||{}).rule||'')+'</b>. Bids are facts only: published price, pre-flight capability, ledger track record.<table class="bids"><tr><th>Lab</th><th>Capability</th><th>Track record</th><th>Quote</th><th>Outcome</th></tr>'+rows+'</table>','think')}
   else if(ev.stage==='hired'){bound('Hired: '+esc((ev.labs||[]).map(shortName).join(', ')||'none')+' · deposits refunded to the rest')}
   else if(ev.stage==='protocol_preregistered'){bound('Protocol locked before any data moved · sha256 '+esc(ev.protocol_hash)+'…')}
   else if(ev.stage==='deliberating'){msg('l','Your agent','All aggregates are in. Reviewing them: the statistics set a ceiling on every claim, the panel can only be more cautious.','think')}
@@ -531,6 +540,15 @@ function renderResult(r){
  var settled=(pay.receipts||[]).filter(function(x){return !x.simulated&&x.status==='settled'}).length;
  var rows=[['Rows of patient data moved','0'],['Gated queries answered',(gates.length-refused)+' of '+gates.length],['Refused by a gate (not charged)',refused],['Small cells suppressed',supp],['Vector operations inside labs',pf.vector_ops+' in '+pf.lab_compute_ms+' ms'],['Language-model time',pf.llm_seconds+' s, '+pf.llm_calls+' calls, local'],['Paid to labs','$'+pay.spent_usd+(settled?' ('+settled+' real x402 settlements)':' (simulated)')]];
  $('led').innerHTML='<tr><th>Item</th><th>Value</th></tr>'+rows.map(function(x){return '<tr><td>'+x[0]+'</td><td>'+x[1]+'</td></tr>'}).join('');
+ var F=D.F||{},FM=D.feature_meaning||{},threats=((D.edge_cases||{}).edge_cases)||[],bh='';
+ V.forEach(function(v){var f=F[v.claim_id];if(!f){return}
+  var fired=Object.keys(f).filter(function(k){return f[k]>=0.5}).sort(function(a,b){return f[b]-f[a]});
+  var isT=/applied directly|transfer/i.test(v.statement);
+  bh+='<div class="vrow"><span class="cid">'+v.claim_id+'</span><div>'+(isT?'<b>Transportability test</b> (majority evidence → minority): ':'')+(fired.length?fired.map(function(k){return '<span class="chip'+(f[k]>=0.8?'':' a')+'" title="'+esc(FM[k]||'')+'">'+esc(k.replace('_',' '))+' '+f[k].toFixed(2)+'</span>'}).join(' '):'<span class="mute">no bias feature above 0.5</span>')+
+   '<div class="mute">'+threats.filter(function(t){return t.claim_id===v.claim_id&&t.severity==='high'}).map(function(t){return t.category.replace(/_/g,' ')+': '+esc(t.threat)}).join(' · ')+'</div></div></div>'});
+ if(BIAS){var t2=(BIAS.transport||[]).find(function(x){return x.minority_n===1000&&x.true_ratio===2}),fa=(BIAS.transport||[]).find(function(x){return x.minority_n===1000&&x.true_ratio===1}),sg=BIAS.small_group||{},pv=BIAS.privacy||{},pl=BIAS.planner||{};
+  bh+='<div class="mute" style="margin-top:8px"><b>How these detectors score on synthetic twins</b> (planted truth, '+BIAS.trials+' trials, same gate and statistics, SYNTHETIC data): '+(t2?'a 2× non-transfer is caught '+Math.round(t2.rate*100)+'% of the time, false alarms '+Math.round((fa||{}).rate*1000)/10+'%':'')+' · a small group answered alone '+sg.alone_answered+'/'+sg.trials+' vs via the network '+sg.network_answered+'/'+sg.trials+' · '+pv.results_released+' released results, '+pv.cells_below_policy+' below the privacy policy · planner routed held-out questions '+pl.held_out_correct+'/'+pl.held_out+' without a language model.</div>'}
+ $('bias').innerHTML=bh||'<div class="mute">Bias features are available in fast mode (vector panel).</div>';
  var p=r.protocol||{};
  $('hash').innerHTML='Run '+esc(r.run_id)+' · protocol sha256 '+esc(p.protocol_hash||'')+' · status <b>'+esc(r.status)+'</b>'+(r.audit_chain?' · audit chain '+(r.audit_chain.valid?'valid':'BROKEN')+' ('+r.audit_chain.entries+' entries)':'');
  $('result').hidden=false;$('result').scrollIntoView({block:'nearest',behavior:'smooth'});

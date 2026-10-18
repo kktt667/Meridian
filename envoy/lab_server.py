@@ -17,7 +17,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from .catalog import LABS, public_catalog
-from .config import PRICES_USD, X402_FACILITATOR, X402_NETWORK
+from .catalog import prices_for
+from .config import X402_FACILITATOR, X402_NETWORK
 from .lab import LabNode
 from .market import reputation
 from .schemas import LabResult
@@ -43,7 +44,7 @@ def make_app(lab_id: str) -> FastAPI:
         routes = {f"POST /query/{tier}": RouteConfig(
             accepts=[PaymentOption(scheme="exact", pay_to=pay_to, price=f"${price:.2f}", network=X402_NETWORK)],
             mime_type="application/json", description=f"{lab_id}: gated aggregate query ({tier} tier)")
-            for tier, price in PRICES_USD.items()}
+            for tier, price in prices_for(lab_id).items()}
         app.add_middleware(PaymentMiddlewareASGI, routes=routes, server=server)
 
     @app.get("/card")

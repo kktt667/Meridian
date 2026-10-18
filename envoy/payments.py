@@ -13,7 +13,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass
 
-from .config import PRICES_USD
+from .catalog import price_for
 
 _SECRET = os.environ.get("ENVOY_PAYMENT_SECRET", "demo-secret-not-for-production").encode()
 
@@ -54,7 +54,7 @@ class SimulatedX402:
 
     def quote(self, lab_id: str, query_id: str, tier: str) -> PaymentRequired:
         return PaymentRequired(scheme="exact", network="base-sepolia (simulated)", asset="USDC (test)",
-                               amount_usd=PRICES_USD[tier], pay_to=f"0xLAB_{lab_id[:10]}_PLACEHOLDER",
+                               amount_usd=price_for(lab_id, tier), pay_to=f"0xLAB_{lab_id[:10]}_PLACEHOLDER",
                                resource=f"/labs/{lab_id}/query/{query_id}")
 
     def escrow(self, req: PaymentRequired, lab_id: str, query_id: str) -> Receipt:

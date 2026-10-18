@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections import Counter
 
 import numpy as np
 
@@ -167,32 +168,97 @@ def run(claims: list[dict], evidence: list[dict], labs_used: list[str], recipe: 
     }
 
 
-# ----------------------------------------------------------------------------- narrator (1 LLM call) + number guard
-NARRATOR_SYSTEM = """You turn a fully computed, audited analysis into plain English for a researcher who is not a
-statistician. Every number you write must be copied exactly from the audit JSON. Do not add facts, numbers or
-recommendations that are not in the audit. Explain each claim's final verdict, why (cite evidence IDs), what
-would change the conclusion, and the main caveats. Short, clear sentences."""
+# ----------------------------------------------------------------------------- narrator: template first, LLM may only reword
+NARRATOR_SYSTEM = """You rewrite a computed, audited research narrative into plain English for a clinician who is not a
+statistician. You may change wording and sentence order only. You must keep EVERY number exactly, EVERY evidence ID
+(E1, E2...), EVERY claim ID (C1, C2...) and EVERY verdict word (supported, not supported, inconclusive, inconsistent)
+attached to the same claim. Do not add facts, numbers, causes, recommendations or opinions. Labs are named Lab A,
+Lab B...: keep those labels. One summary sentence per claim, in order, and each one MUST start with its claim ID
+("C1: ..."). Keep the statistical words as they are: say "odds", never "risk"; never say "cause", "causes", "leads to",
+"prevent" or "should"."""
+
+DRIFT_WORDS = ("risk", "cause", "causes", "caused", "leads to", "prevent", "should", "significant")
+
+VERDICT_WORD = {"supported": "supported", "not_supported": "not supported", "inconclusive": "inconclusive", "inconsistent": "inconsistent"}
 
 
-def narrate(llm: LLM, question: str, verdicts: list[dict], evidence: list[dict], panel: dict, local_steps: list) -> dict:
-    audit = {"question": question, "verdicts": [{k: v[k] for k in ("claim_id", "statement", "final", "ceiling_reason", "certainty")} for v in verdicts],
-             "evidence": [{k: e[k] for k in ("evidence_id", "description", "estimate", "ci_low", "ci_high", "status", "refusal")} for e in evidence],
-             "local_breakdown": local_steps,
-             "top_threats": [t for t in panel["edge_cases"]["edge_cases"] if t["severity"] == "high"][:6]}
-    text = json.dumps(audit, default=str)
+def template_narrative(question: str, verdicts: list[dict], evidence: list[dict], panel: dict) -> dict:
+    """Deterministic narrative built only from the audit objects. Every number here is traceable by construction."""
+    ev = {e["evidence_id"]: e for e in evidence}
+    counts = Counter(v["final"] for v in verdicts)
+    key = next((v for v in verdicts if "applied directly" in v["statement"] or "transfer" in v["statement"].lower()), None) or \
+          next((v for v in verdicts if v["final"] in ("not_supported", "inconsistent")), verdicts[0] if verdicts else None)
+    head = ", ".join(f"{n} {VERDICT_WORD[k]}" for k, n in counts.items())
+    headline = f"{len(verdicts)} claims: {head}." + (f" Key result: {key['claim_id']} is {VERDICT_WORD[key['final']]}: {key['ceiling_reason']}" if key else "")
+    summary = []
+    for v in verdicts:
+        main = next((ev[i] for i in reversed(v["evidence_ids"]) if ev.get(i, {}).get("kind") == "derived"), None)
+        est = (f" ({main['evidence_id']}: {main['estimate']:.2f}, 95% CI {main['ci_low']:.2f}-{main['ci_high']:.2f})"
+               if main and main.get("estimate") is not None else "")
+        down = ""
+        if v["final"] != v["ceiling"]:
+            objs = [o for o in v.get("steward_objections", []) if o.get("severity") == "high"]
+            f = (panel.get("F") or {}).get(v["claim_id"], {})
+            top = ", ".join(f"{k.replace('_', ' ')} {x:.2f}" for k, x in sorted(f.items(), key=lambda t: -t[1])[:2] if x > 0)
+            if objs:
+                down = f" Downgraded from {VERDICT_WORD[v['ceiling']]}: the {objs[0].get('lab', 'data')} steward objected ({objs[0].get('reason', objs[0].get('issue', ''))[:140]})."
+            elif top:
+                down = f" The review panel downgraded it from {VERDICT_WORD[v['ceiling']]} because of {top}."
+            else:
+                down = f" The review panel voted more cautiously than the statistics and downgraded it from {VERDICT_WORD[v['ceiling']]}."
+        summary.append(f"{v['claim_id']}: {v['statement']} Verdict: {VERDICT_WORD[v['final']]}{est}. {v['ceiling_reason']}{down}")
+    high = [t for t in panel["edge_cases"]["edge_cases"] if t["severity"] == "high"]
+    change = sorted({t["how_to_check"] for t in high})[:4] or ["More labs with enough cases."]
+    caveats = sorted({t["threat"] for t in high})[:4] + ["All labs: self-reported, cross-sectional survey data; associations, not causes."]
+    return {"headline": headline, "summary": summary, "what_would_change_it": change, "caveats": caveats}
+
+
+def _numbers(obj) -> set[str]:
+    return {f"{float(x):.2f}" for x in re.findall(r"\d+\.\d+", json.dumps(obj))}
+
+
+def guard(template: dict, rewritten: dict, verdicts: list[dict]) -> list[str]:
+    """Why a rewrite is rejected. Empty list = accepted."""
+    problems = []
+    extra = _numbers(rewritten) - _numbers(template)
+    if extra:
+        problems.append(f"numbers not in the audit: {sorted(extra)}")
+    if len(rewritten["summary"]) != len(verdicts):
+        problems.append(f"{len(rewritten['summary'])} summary sentences for {len(verdicts)} claims")
+    for v, sent in zip(verdicts, rewritten["summary"]):
+        if v["claim_id"] not in sent:
+            problems.append(f"{v['claim_id']} missing from its sentence")
+        w = VERDICT_WORD[v["final"]]
+        if not re.search(rf"\b{w}\b", sent, re.I) or (w == "supported" and re.search(r"\bnot supported\b", sent, re.I)):
+            problems.append(f"{v['claim_id']} verdict '{w}' changed or missing")
+    tmpl_text = json.dumps(template).lower()
+    drift = [d for d in DRIFT_WORDS if re.search(rf"\b{d}\b", json.dumps(rewritten).lower()) and not re.search(rf"\b{d}\b", tmpl_text)]
+    if drift:
+        problems.append(f"meaning drift, words added that are not in the audit: {drift}")
+    return problems
+
+
+def narrate(llm: LLM, question: str, verdicts: list[dict], evidence: list[dict], panel: dict, local_steps: list,
+            blind_labs: list[str] | None = None) -> dict:
+    from .agents import apply_map, blind_map
+    template = template_narrative(question, verdicts, evidence, panel)
+    out = {**template, "template": template, "mode": "template", "guard": [], "blind": bool(blind_labs), "unverified_numbers": []}
+    m = blind_map(blind_labs) if blind_labs else {}
+    blinded = json.loads(apply_map(json.dumps(template), m)) if m else template
     try:
-        n = llm.structured("narrator", NARRATOR_SYSTEM, f"Audit JSON:\n{text}", Narrative)
-        n, mode = n.model_dump(), "llm"
+        n = llm.structured("narrator", NARRATOR_SYSTEM, f"Narrative to reword (JSON):\n{json.dumps(blinded)}", Narrative).model_dump()
     except AgentFailed as e:
-        llm.notes.append(f"narrator offline fallback: {e}")
-        n = {"headline": "; ".join(f"{v['claim_id']} {v['final']}" for v in verdicts),
-             "summary": [f"{v['claim_id']}: {v['statement']} -> {v['final']} ({v['ceiling_reason']})" for v in verdicts],
-             "what_would_change_it": ["More labs with enough cases", "Measured rather than self-reported outcomes"],
-             "caveats": ["Self-reported, cross-sectional survey data."]}
-        mode = "template"
-    # number guard: any decimal number not present in the audit is flagged
-    allowed = set(re.findall(r"\d+\.\d+", text)) | {f"{float(x):.2f}" for x in re.findall(r"\d+\.\d+", text)}
-    written = re.findall(r"\d+\.\d+", json.dumps(n))
-    n["unverified_numbers"] = sorted({x for x in written if x not in allowed and f"{float(x):.2f}" not in allowed})
-    n["mode"] = mode
-    return n
+        llm.notes.append(f"narrator unavailable, template used: {e}")
+        out["guard"] = [f"language model unavailable ({e})"]
+        return out
+    out["llm_blinded"] = n
+    problems = guard(blinded, n, verdicts)
+    if problems:
+        out["guard"] = problems
+        out["mode"] = "template (LLM rewrite rejected)"
+        return out
+    unmap = {v: k for k, v in m.items()}
+    n = json.loads(apply_map(json.dumps(n), unmap)) if unmap else n
+    out.update(n)
+    out["mode"] = "llm rewrite of template (guard passed)"
+    return out

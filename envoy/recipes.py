@@ -68,15 +68,16 @@ class Network:
         except RuntimeError as e:
             if "payment failed" not in str(e):
                 raise
-            res = LabResult(query_id=qid, lab_id=lab_id, operation=operation, status="refused", refusal="budget_exhausted")
-            self.audit.add("x402_payment_failed", {"lab": lab_id, "query_id": qid, "error": str(e)[:200]})
+            res = LabResult(query_id=qid, lab_id=lab_id, operation=operation, status="refused", refusal="payment_failed")
+            self.audit.add("x402_payment_failed", {"lab": lab_id, "query_id": qid, "error": str(e)[:200],
+                                                   "attempts": getattr(node, "attempts", None)})
         except Exception as e:  # any lab-side failure is a verifiable SLA breach, never silently ignored
             res = LabResult(query_id=qid, lab_id=lab_id, operation=operation, status="refused", refusal="sla_failure")
             self.audit.add("sla_failure", {"lab": lab_id, "query_id": qid, "error": str(e)[:200]})
         self.audit.add("result_received", res.model_dump())
         if remote and not local and node.last_payment:
-            from .config import PRICES_USD
-            r = self.pay.record_x402(lab_id, qid, PRICES_USD[self.tier], node.last_payment)
+            from .catalog import price_for
+            r = self.pay.record_x402(lab_id, qid, price_for(lab_id, self.tier), node.last_payment)
             self.audit.add("x402_payment", {"lab": lab_id, "query_id": qid, **node.last_payment})
             self._log({"step": "x402_" + r.status.split(" ")[0], "lab": lab_id, "query_id": qid,
                                   "transaction": node.last_payment.get("transaction"), "network": node.last_payment.get("network")})

@@ -20,7 +20,7 @@ Operation = Literal["logistic_or", "event_split_strata", "undiagnosed_strata"]
 Tier = Literal["verdict", "evidence", "audit"]
 RefusalCode = Literal[
     "min_population", "min_cases", "min_cell_all_strata", "budget_exhausted",
-    "overlap_detected", "variable_unavailable", "group_unavailable", "sla_failure", "not_hired",
+    "overlap_detected", "variable_unavailable", "group_unavailable", "sla_failure", "not_hired", "payment_failed",
 ]
 CheckCode = Literal[
     "schema_valid", "min_population_ok", "min_cases_ok", "cells_suppressed", "budget_ok",

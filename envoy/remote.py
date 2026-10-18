@@ -62,12 +62,12 @@ class RemoteLab:
     def handle(self, request_json: str) -> str:
         session, http = _x402_session()
         import time
-        for attempt in range(3):  # transient facilitator settlement failures: retry with a fresh authorization
+        for attempt in range(4):  # transient facilitator settlement failures: retry with a fresh authorization (stays inside the 30 s SLA)
             r = session.post(f"{self.url}/query/{self.tier}", data=request_json, timeout=120,
                              headers={"content-type": "application/json"})
             if r.status_code != 402:
                 break
-            time.sleep(1.5 * (attempt + 1))
+            time.sleep(2.0 * (attempt + 1))
         self.attempts = attempt + 1
         settle = None
         try:

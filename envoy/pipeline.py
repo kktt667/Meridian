@@ -8,7 +8,7 @@ import uuid
 from collections import Counter
 from pathlib import Path
 
-from . import agents, market, protocol, vector_panel
+from . import stats, agents, market, protocol, vector_panel
 from .audit import AuditLog
 from .catalog import LABS
 from .config import DEFAULT_BUDGET_USD, RUNS_DIR
@@ -77,14 +77,23 @@ def run(question: str, home: str, documents: list[dict] | None = None, tier: str
 
     # 1. Plan
     stage("planning")
-    p, plan_mode = agents.plan(llm, question, home, documents or [])
+    p, plan_mode = agents.plan(question, home)
     params, fixes = agents.validate_plan(p, home)
     chosen = [l for l in (preferred_labs or []) if l in LABS and l != home]
-    if chosen and params["recipe"] != "unsupported":  # the researcher's own choice of partner labs wins over the planner's
-        fixes.append(f"Researcher selected partner labs: {', '.join(chosen)}")
-        params["external_labs"] = chosen
+    if chosen and params["recipe"] != "unsupported":  # the researcher's own choice of partner labs wins over the planner's,
+        # but only labs that can run this recipe at all (catalog check, same rule as the planner)
+        able = [l for l in chosen if params["recipe"] != "undiagnosed_comparison" or LABS[l]["measured_bp"]]
+        dropped = [l for l in chosen if l not in able]
+        if able:
+            params["external_labs"] = able
+        note = f"Researcher chose partner labs: {', '.join(able) or 'none usable'}"
+        if dropped:
+            note += f"; skipped {', '.join(dropped)} (no measured blood pressure, cannot run this analysis)"
+        fixes.append(note)
     audit.add("plan", {"mode": plan_mode, "plan": p.model_dump(), "validated": params, "corrections": fixes})
-    stage("plan_ready", recipe=params["recipe"], mode=plan_mode)
+    from .planner_ml import explain
+    stage("plan_ready", recipe=params["recipe"], mode=plan_mode, plan=p.model_dump(), validated=params, corrections=fixes,
+          explain=explain(question))
     if params["recipe"] == "unsupported":
         result = {"run_id": run_id, "status": "unsupported", "question": question, "home": home, "plan": p.model_dump(),
                   "plan_corrections": fixes, "message": "The network's approved analyses cannot answer this question.",
@@ -110,18 +119,20 @@ def run(question: str, home: str, documents: list[dict] | None = None, tier: str
             deposits[card["lab_id"]] = net.pay.escrow(req, card["lab_id"], "job-offer")
         d, dmode = market.lab_decides(llm if deep else None, card, job)
         decisions[card["lab_id"]] = {**d, "offered": offered, "mode": dmode}
-        stage("lab_decision", lab=card["lab_id"], accept=d["accept"], capability=card["capability"])
-    hired = market.choose(cards, decisions, params.get("external_labs", []), recipe)
+        stage("lab_decision", lab=card["lab_id"], accept=d["accept"], capability=card["capability"], card=card, decision=decisions[card["lab_id"]])
+    bids = [market.bid(c, decisions[c["lab_id"]], recipe, tier) for c in cards]
+    hired, selection = market.select(bids, params.get("external_labs", []), budget_usd - net.pay.spent)
+    stage("bids", bids=bids, selection=selection)
     for lab_id, r in deposits.items():
         (net.pay.release if lab_id in hired else net.pay.refund)(r)
     params["external_labs"] = hired
-    audit.add("hiring", {"job": job, "cards": cards, "decisions": decisions, "hired": hired})
+    audit.add("hiring", {"job": job, "cards": cards, "decisions": decisions, "bids": bids, "selection": selection, "hired": hired})
     stage("hired", labs=hired)
 
     # 3. Pre-register the protocol (facts, estimand, decision rules) BEFORE any lab releases data
     proto = protocol.build(recipe, params, home, question)
     audit.add("protocol_preregistered", {"protocol_hash": proto["protocol_hash"], "protocol": proto})
-    stage("protocol_preregistered", protocol_hash=proto["protocol_hash"][:16])
+    stage("protocol_preregistered", protocol_hash=proto["protocol_hash"][:16], protocol=proto)
 
     # 4. Local analysis, then paid external queries (inside the recipe)
     stage("querying_labs")
@@ -129,7 +140,8 @@ def run(question: str, home: str, documents: list[dict] | None = None, tier: str
     claims = RECIPES[recipe](net, **params)
     recipe_ms = (time.perf_counter() - t_recipe) * 1000
     labs_used = [home] + [l for l in params.get("external_labs", []) if l != home]
-    stage("evidence_ready", n_evidence=len(net.evidence), n_claims=len(claims))
+    stage("evidence_ready", n_evidence=len(net.evidence), n_claims=len(claims), claims=[c.model_dump() for c in claims],
+          evidence=[e.model_dump() for e in net.evidence], local_breakdown=net.local_steps)
 
     # 3. Debate and vote (agents see aggregates only; lab names blinded by default)
     pack = agents.build_pack(question, home, claims, net.evidence, net.local_steps, p, labs_used)
@@ -141,7 +153,9 @@ def run(question: str, home: str, documents: list[dict] | None = None, tier: str
         t_vec = time.perf_counter()
         debate = vector_panel.run([c.model_dump() for c in claims], [e.model_dump() for e in net.evidence], labs_used, recipe)
         debate["panel_ms"] = round((time.perf_counter() - t_vec) * 1000, 2)
-        emit("vector_panel", ms=debate["panel_ms"], claims=len(claims), lenses=len(debate["lenses"]), features=len(debate["features"]))
+        emit("vector_panel", ms=debate["panel_ms"], claims=len(claims), lenses=len(debate["lenses"]), features=len(debate["features"]),
+             F=debate["F"], S=debate["S"], W=debate["weights"], thresholds=debate["thresholds"], feature_names=debate["features"],
+             lens_names=debate["lenses"], ballots=debate["ballots"], threats=debate["edge_cases"]["edge_cases"])
     audit.add("debate", {"modes": debate["modes"], "dropped_points": debate["dropped_points"],
                          "ballots": {k: v["votes"] for k, v in debate["ballots"].items()}})
 
@@ -180,6 +194,31 @@ def run(question: str, home: str, documents: list[dict] | None = None, tier: str
         labs_ok = {ev[i].lab for i in c.evidence_ids if ev[i].kind == "lab_result" and ev[i].status == "ok"}
         v["certainty"] = protocol.certainty(v["final"], main.model_dump() if main else None, main.i2 if main else None,
                                             len(labs_ok), c.cross_population)
+    # What a naive analysis of the SAME numbers would conclude: no transportability test, no heterogeneity rule, no panel.
+    for v, c in zip(verdicts, claims):
+        derived = [ev[i] for i in c.evidence_ids if ev[i].kind == "derived"]
+        main = derived[-1] if derived else None
+        if "applied directly" in c.statement:
+            naive, why = "supported", "assumes the external effect size applies to the local group; no transportability test"
+        elif v["ceiling"] == "inconsistent" and main and main.estimate is not None:
+            naive, _ = stats.ceiling_for_effect(main.model_dump())
+            why = f"pools the labs and ignores that they disagree (I2 {main.i2:.0%})"
+        elif v["final"] != v["ceiling"]:
+            naive, why = v["ceiling"], "statistics only; no review panel, no steward"
+        else:
+            naive, why = v["final"], "same conclusion"
+        v["naive"] = {"verdict": naive, "why": why, "differs": naive != v["final"]}
+    # Name-swap invariance (fast mode): rename every lab and country cyclically, rerun the panel, compare votes.
+    invariance = None
+    if not deep and len(labs_used) >= 2:
+        rot = {l: labs_used[(i + 1) % len(labs_used)] for i, l in enumerate(labs_used)}
+        m = {**rot, **{LABS[a]["country"]: LABS[b]["country"] for a, b in rot.items()}}
+        sw_claims = json.loads(agents.apply_map(json.dumps(cl_dump), m))
+        sw_ev = json.loads(agents.apply_map(json.dumps(ev_dump), m))
+        sw = vector_panel.run(sw_claims, sw_ev, [rot[l] for l in labs_used], recipe)
+        same = all(a["verdict"] == b["verdict"] for l in sw["ballots"] for a, b in zip(sw["ballots"][l]["votes"], debate["ballots"][l]["votes"]))
+        invariance = {"name_swap_identical": same, "mapping": rot}
+        audit.add("invariance_check", invariance)
     by_claim = {v["claim_id"]: v for v in verdicts}
     refused = [e.lab for e in net.evidence if e.kind == "lab_result" and e.status == "refused"]
     for f in proto["facts"]:
@@ -189,8 +228,8 @@ def run(question: str, home: str, documents: list[dict] | None = None, tier: str
             f["status"] = "met" if not refused else f"partly met: gate refused at {', '.join(sorted(set(refused)))}"
         else:
             f["status"] = "met: all labs use 'ever diagnosed by a doctor' items"
-    stage("narrating")
-    narrative = vector_panel.narrate(llm, question, verdicts, ev_dump, debate, net.local_steps)
+    stage("narrating", verdicts=verdicts, blind=blind)
+    narrative = vector_panel.narrate(llm, question, verdicts, ev_dump, debate, net.local_steps, labs_used if blind else [])
     audit.add("narrative", narrative)
     audit.add("verdicts", {"verdicts": verdicts, "facts": proto["facts"]})
     market.record(run_id, net, decisions, stewards)
@@ -199,10 +238,10 @@ def run(question: str, home: str, documents: list[dict] | None = None, tier: str
     result = {
         "run_id": run_id, "status": "awaiting_signoff", "question": question, "home": home, "tier": tier,
         "plan": p.model_dump(), "plan_mode": plan_mode, "plan_corrections": fixes, "recipe": recipe, "protocol": proto,
-        "marketplace": {"job": job, "cards": cards, "decisions": decisions, "hired": hired}, "stewards": stewards,
+        "marketplace": {"job": job, "cards": cards, "decisions": decisions, "bids": bids, "selection": selection, "hired": hired}, "stewards": stewards,
         "local_breakdown": net.local_steps, "evidence": [e.model_dump() for e in net.evidence],
         "mode": mode, "narrative": narrative, "verdicts": verdicts, "debate": debate, "payments": net.pay.summary(), "lab_traffic": net.timeline,
-        "ai": llm.cost_summary(), "timeline": timeline,
+        "ai": llm.cost_summary(), "timeline": timeline, "invariance": invariance,
         "performance": _performance(net, recipe_ms, llm),
         "limits": pack["standing_caveats"] + (["Payments are SIMULATED (x402-style flow, test values only)."] if net.pay.summary()["simulated"]
                                               else ["Payments are real x402 settlements on the Base Sepolia TESTNET (test USDC); job deposits and penalties are simulated."]),

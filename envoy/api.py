@@ -53,6 +53,11 @@ class SignoffRequest(BaseModel):
 
 @app.get("/")
 def index():
+    return FileResponse(ROOT / "envoy" / "static" / "live.html")
+
+
+@app.get("/meridian")
+def meridian():
     return FileResponse(ROOT / "envoy" / "static" / "meridian.html")
 
 
@@ -84,8 +89,27 @@ def list_runs(limit: int = 30):
 
 @app.get("/catalog")
 def catalog():
+    from .market import reputation
     labs = pipeline.get_labs()
-    return public_catalog({k: v.size_bucket for k, v in labs.items()})
+    return [{**c, "reputation": reputation(c["lab_id"])} for c in public_catalog({k: v.size_bucket for k, v in labs.items()})]
+
+
+@app.get("/bias_report")
+def bias_report():
+    """Results of scripts/twin_eval.py: synthetic-twin bias tests + planner accuracy. Synthetic data only."""
+    p = ROOT / "runs" / "twin_eval.json"
+    if not p.exists():
+        raise HTTPException(404, "run scripts/twin_eval.py first")
+    return json.loads(p.read_text())
+
+
+@app.post("/bias_benchmark")
+def bias_benchmark(trials: int = 60):
+    """Plant bias in synthetic twin labs and run them through the real gate and statistics, live. Synthetic data only."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("twin_eval", ROOT / "scripts" / "twin_eval.py")
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    return mod.benchmark(trials=max(10, min(trials, 200)))
 
 
 @app.get("/demos")
@@ -119,6 +143,27 @@ def get_run(run_id: str):
     if not p.exists():
         raise HTTPException(404, "unknown run")
     return json.loads(p.read_text())
+
+
+@app.get("/runs/{run_id}/audit/tamper")
+def tamper_demo(run_id: str, entry: int = 3):
+    """Demo only: verify an in-memory COPY of the chain with one payload value changed. The real file is untouched."""
+    import hashlib
+    p = RUNS_DIR / run_id / "audit.jsonl"
+    if not p.exists():
+        raise HTTPException(404, "unknown run")
+    chain = [json.loads(l) for l in p.read_text().splitlines()]
+    entry = max(0, min(entry, len(chain) - 1))
+    chain[entry]["payload"] = {**chain[entry]["payload"], "tampered": "verdict changed after the fact"}
+    prev, broken_at = "GENESIS", None
+    for i, e in enumerate(chain):
+        body = {k: e[k] for k in ("ts", "kind", "payload", "prev")}
+        if e["prev"] != prev or hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest() != e["hash"]:
+            broken_at = i
+            break
+        prev = e["hash"]
+    return {"tampered_entry": entry, "kind": chain[entry]["kind"], "valid": broken_at is None, "broken_at": broken_at,
+            "note": "A copy of the log was edited in memory; the stored log is unchanged."}
 
 
 @app.get("/runs/{run_id}/audit")

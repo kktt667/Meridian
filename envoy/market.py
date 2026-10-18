@@ -13,7 +13,7 @@ import json
 import time
 from collections import Counter, defaultdict
 
-from .catalog import LABS
+from .catalog import LABS, price_for
 from .config import RUNS_DIR
 from .lab import LabNode
 from .llm import LLM, AgentFailed
@@ -94,6 +94,60 @@ def discover(labs: dict[str, LabNode], home: str, recipe: str, purpose_category:
     return out
 
 
+# ---------------------------------------------------------------- sealed bids + auditable selection (code, no LLM)
+CAPABILITY_RANK = {"full": 2, "partial": 1, "none": 0}
+
+
+def bid(card: dict, decision: dict, recipe: str, tier: str) -> dict:
+    """A lab's sealed bid is facts only: its published per-query price at this tier, the job total for the
+    queries this recipe needs, its pre-flight capability and its ledger reputation. Nothing self-described."""
+    n_q = len(REQUIREMENTS[recipe])
+    per = price_for(card["lab_id"], tier)
+    rep = card["reputation"]
+    return {"lab_id": card["lab_id"], "accepted": bool(decision["accept"]), "capability": card["capability"],
+            "price_per_query_usd": per, "job_quote_usd": round(per * n_q, 2), "queries": n_q,
+            "rate_multiplier": LABS[card["lab_id"]]["policy"]["rate_multiplier"],
+            "answer_rate": rep["answer_rate"], "queries_served": rep["queries_served"], "sla_failures": rep["sla_failures"],
+            "sla_seconds": LABS[card["lab_id"]]["policy"]["sla_seconds"], "stake_usd": LABS[card["lab_id"]]["policy"]["stake_usd"],
+            "conditions": decision.get("conditions", [])}
+
+
+def select(bids: list[dict], preferred: list[str], budget_usd: float, k: int = 2) -> tuple[list[str], dict]:
+    """Rank accepted bids: capability first, then track record (answer rate; new labs count as 0.5), then price.
+    Take up to k within budget. The researcher's own preferred labs win if they bid. Every outcome has a reason."""
+    reasons: dict[str, str] = {}
+    pool = []
+    for b in bids:
+        if not b["accepted"]:
+            reasons[b["lab_id"]] = "declined or not offered"
+        elif b["capability"] == "none":
+            reasons[b["lab_id"]] = "pre-flight: cannot answer any required analysis"
+        else:
+            pool.append(b)
+    key = lambda b: (-CAPABILITY_RANK[b["capability"]], -(b["answer_rate"] if b["answer_rate"] is not None else 0.5),
+                     b["sla_failures"], b["job_quote_usd"])
+    ranked = sorted(pool, key=key)
+    pref = [b for b in ranked if b["lab_id"] in preferred]
+    order = pref + [b for b in ranked if b["lab_id"] not in preferred]
+    hired, spent = [], 0.0
+    for i, b in enumerate(order):
+        rec = "new lab" if b["answer_rate"] is None else f"answer rate {b['answer_rate']:.0%}"
+        facts = f"{b['capability']} capability, {rec}, ${b['job_quote_usd']:.2f} for {b['queries']} queries"
+        if len(hired) >= k:
+            better = order[k - 1]
+            reasons[b["lab_id"]] = f"lost: {facts}; outranked by {better['lab_id']} (" + (
+                "higher capability" if CAPABILITY_RANK[better["capability"]] > CAPABILITY_RANK[b["capability"]] else
+                "better track record" if (better["answer_rate"] or 0.5) > (b["answer_rate"] or 0.5) else
+                "cheaper" if better["job_quote_usd"] < b["job_quote_usd"] else "tie, earlier in catalog") + ")"
+        elif spent + b["job_quote_usd"] > budget_usd + 1e-9:
+            reasons[b["lab_id"]] = f"lost: {facts}; would exceed the remaining budget ${budget_usd - spent:.2f}"
+        else:
+            hired.append(b["lab_id"]); spent += b["job_quote_usd"]
+            reasons[b["lab_id"]] = ("won (requested): " if b["lab_id"] in preferred else "won: ") + facts
+    return hired, {"hired": hired, "reasons": reasons, "rule": "capability > track record > SLA failures > price; "
+                   f"up to {k} labs within budget; the researcher's preferred labs are taken first", "committed_usd": round(spent, 2)}
+
+
 # ---------------------------------------------------------------- the lab's own agent decides
 LAB_AGENT_SYSTEM = """You are the AI agent that represents one research lab's dataset in a federated network.
 Another lab wants to hire you. Decide whether to ACCEPT the job. Rules:
@@ -128,15 +182,6 @@ def lab_decides(llm: LLM, card: dict, job: dict) -> tuple[dict, str]:
         partial = [c["requirement"] for c in card["preflight"] if not c["can_answer"]]
         return {"accept": True, "reason": "Policy passed and pre-flight shows the gate can answer the job.",
                 "conditions": [f"Cannot answer: {p}" for p in partial], "by": "offline rule"}, "offline"
-
-
-def choose(cards: list[dict], decisions: dict, preferred: list[str], recipe: str) -> list[str]:
-    accepted = [c for c in cards if decisions[c["lab_id"]]["accept"]]
-    picks = [c["lab_id"] for c in accepted if c["lab_id"] in preferred]
-    if not picks:
-        full = [c for c in accepted if c["capability"] == "full"]
-        picks = [c["lab_id"] for c in full[:2]] or [c["lab_id"] for c in accepted[:1]]
-    return picks
 
 
 # ---------------------------------------------------------------- lab stewards review their own evidence

@@ -8,8 +8,9 @@ PURPOSES = ["public_health_research", "academic_research", "clinical_guideline_r
             "re_identification", "insurance_pricing", "marketing", "law_enforcement"]
 
 
-def _policy(model: str, min_population: int = MIN_POPULATION, **kw) -> dict:
-    return {"min_population": min_population, "min_cell": MIN_CELL, "min_cases": MIN_CASES_MODEL,
+def _policy(model: str, min_population: int = MIN_POPULATION, rate: float = 1.0, **kw) -> dict:
+    # rate: the lab's published multiplier on the network's base prices (its bid is base x rate, per query)
+    return {"min_population": min_population, "min_cell": MIN_CELL, "min_cases": MIN_CASES_MODEL, "rate_multiplier": rate,
             "allowed_purposes": ["public_health_research", "academic_research", "clinical_guideline_review"],
             "refused_purposes": ["re_identification", "insurance_pricing", "marketing", "law_enforcement"],
             "max_queries_per_job": 8, "sla_seconds": 30, "stake_usd": 5.0, "agent_model": model, **kw}
@@ -21,7 +22,7 @@ LABS = {
         "source": "CDC BRFSS 2023 annual survey (telephone)", "url": "https://www.cdc.gov/brfss/annual_data/annual_2023.html",
         "licence_note": "US government survey data; check CDC terms.",
         "groups": ["White", "Black", "Asian", "Hispanic", "AIAN", "Other"],
-        "measured_bp": False, "policy": _policy("llama3.1:8b"),
+        "measured_bp": False, "policy": _policy("llama3.1:8b", rate=1.0),
         "notes": ["Telephone survey (landline + cell).", "Age is top-coded at 80.", "Race is an imputed broad category (_IMPRACE)."],
         "definitions": {
             "hypertension": "Ever told by a health professional you have high blood pressure (BPHIGH6; pregnancy-only and borderline excluded)",
@@ -36,7 +37,7 @@ LABS = {
         "url": "https://www.ibge.gov.br/estatisticas/sociais/saude/9160-pesquisa-nacional-de-saude.html",
         "licence_note": "IBGE public microdata; check IBGE terms.",
         "groups": ["White", "Black", "Asian", "Brown", "Indigenous"],
-        "measured_bp": False, "policy": _policy("mistral:7b"),
+        "measured_bp": False, "policy": _policy("mistral:7b", rate=0.8),
         "notes": ["Household interview of one selected adult per home.",
                   "The heart-attack item (Q06307) is only asked if the respondent reports heart disease (Q06306); "
                   "'no heart disease' must be coded as 'no heart attack'.", "Self-reported colour/race (C009)."],
@@ -52,7 +53,7 @@ LABS = {
         "source": "KDCA KNHANES 2024 (interview + examination)", "url": "https://knhanes.kdca.go.kr",
         "licence_note": "Registration-based download; no redistribution.",
         "groups": [],
-        "measured_bp": True, "policy": _policy("qwen2.5:7b", min_population=30),
+        "measured_bp": True, "policy": _policy("qwen2.5:7b", min_population=30, rate=1.4),
         "notes": ["Diagnosis items coded 0/1; 8 = not applicable and 9 = unknown are treated as missing.",
                   "Single survey year (2024); small numbers of young strokes.", "Blood pressure is the mean of the 2nd and 3rd readings."],
         "definitions": {
@@ -68,7 +69,7 @@ LABS = {
         "source": "CDC NHANES 2017-2018 (interview + examination)", "url": "https://wwwn.cdc.gov/nchs/nhanes/",
         "licence_note": "US government survey data; check CDC terms.",
         "groups": ["White", "Black", "Asian", "Hispanic", "Other"],
-        "measured_bp": True, "policy": _policy("llama3.1:8b"),
+        "measured_bp": True, "policy": _policy("llama3.1:8b", rate=1.1),
         "notes": ["2017-18 cycle; medical-condition items asked of adults 20+.", "Blood pressure: mean of up to three readings."],
         "definitions": {
             "hypertension": "Ever told by a doctor you had high blood pressure (BPQ020)",
@@ -78,6 +79,15 @@ LABS = {
         },
     },
 }
+
+def price_for(lab_id: str, tier: str) -> float:
+    """What this lab charges per query at this tier: network base price x the lab's published rate."""
+    return round(PRICES_USD[tier] * LABS[lab_id]["policy"]["rate_multiplier"], 2)
+
+
+def prices_for(lab_id: str) -> dict:
+    return {t: price_for(lab_id, t) for t in PRICES_USD}
+
 
 GATE_POLICY = {
     "min_cell": MIN_CELL, "min_cases_for_estimates": MIN_CASES_MODEL, "min_population": MIN_POPULATION,
@@ -93,7 +103,7 @@ def public_catalog(n_buckets: dict | None = None) -> list[dict]:
             "variables": sorted(m["definitions"].keys()),
             "definitions": m["definitions"],
             "operations": ["logistic_or", "event_split_strata"] + (["undiagnosed_strata"] if m["measured_bp"] else []),
-            "prices_usd": PRICES_USD, "gate": GATE_POLICY, "policy": m["policy"],
+            "prices_usd": prices_for(lab_id), "base_prices_usd": PRICES_USD, "gate": GATE_POLICY, "policy": m["policy"],
             "size": (n_buckets or {}).get(lab_id, "unknown"),
             "wallet": f"0xLAB_{lab_id[:10]}_PLACEHOLDER",
         })
